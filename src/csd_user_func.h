@@ -100,6 +100,7 @@ enum CSD_PROGRAM_INDEX {
 	LEVELDB_CRC_PROGRAM_INDEX,
 	ROCKSDB_COMPACTION_PROGRAM_INDEX,
 	ROCKSDB_CRC_PROGRAM_INDEX,
+	ROCKSDB_MVCC_FILTER_PROGRAM_INDEX, // naive/sync FindNextUserEntry-offload baseline
 	HYBRID_ENCODING_PROGRAM_INDEX,
 	HYBRID_DECODING_PROGRAM_INDEX,
 	ROCKSDB_MAGIC_COMPACTION_PROGRAM_INDEX,
@@ -281,6 +282,29 @@ struct rocksdb_read_params {
 	uint16_t search_type[4]; // 0: index->data, 1: data
 };
 
+// Naive/sync FindNextUserEntry-offload baseline (ROCKSDB_MVCC_FILTER_PROGRAM_INDEX).
+// buf_in is the WHOLE raw SST file (host loads it verbatim -- no host-side offset
+// pre-computation, unlike rocksdb_read_params); the kernel parses the footer,
+// metaindex block, and index block itself to find data blocks. See
+// __rocksdb_mvcc_filter() in csd_user_func.c.
+struct rocksdb_mvcc_filter_params {
+	size_t sstable_size; // actual (unaligned) SST file size -- do not use the
+			      // SLM/DMA-aligned buffer size for this
+	uint64_t snapshot_seq; // read snapshot sequence number; entries with a higher
+				// internal sequence number are filtered out
+	size_t output_capacity; // total capacity of buf_out, including the
+				 // rocksdb_mvcc_filter_output header
+};
+
+// Header written at the start of buf_out by __rocksdb_mvcc_filter(), followed by
+// a flat stream of [uint32 key_len][key bytes][uint32 value_len][value bytes]...
+// entries. "key" is the FULL internal key (user_key + 8-byte seq/type suffix) so
+// the host can feed it directly into an InternalIterator.
+struct rocksdb_mvcc_filter_output {
+	uint64_t keys_seen;
+	uint64_t keys_filtered;
+};
+
 struct rocksdb_magic_read_params {
 	struct rocksdb_read_params read_params;
 	size_t input_buf;
@@ -324,6 +348,7 @@ struct CSD_PARAMS {
 		struct rocksdb_crc_params rocksdb_crc_params;
 		struct decoding_params decoding_params;
 		struct rocksdb_read_params rocksdb_read_params;
+		struct rocksdb_mvcc_filter_params rocksdb_mvcc_filter_params;
 	};
 	struct profile_info {
 		int pid;
@@ -469,6 +494,7 @@ size_t __leveldb_crc_calculation(void *buf_in, void *buf_out, size_t size, void 
 size_t __rocksdb_compaction(void *buf_in, void *buf_out, size_t size, void *param);
 size_t __rocksdb_crc_calculation(void *buf_in, void *buf_out, size_t size, void *param);
 size_t __rocksdb_read(void *buf_in, void *buf_out, size_t size, void *param);
+size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *param);
 
 size_t __magic_rocksdb_compaction(void *param);
 size_t __magic_rocksdb_crc_calculation(void *param);

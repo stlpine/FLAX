@@ -1,4 +1,10 @@
-#define NVMEV_CSD_PROFILE		(0)
+// Overridable at build time: `make NVMEV_CSD_PROFILE=1` (see src/Makefile) turns
+// this into dmesg-based COMPUTE/REALCOMPUTE tracing (incl. __rocksdb_mvcc_filter,
+// via NVMEV_CSD_PROFILE_REAL_START/END) with no perf/symbol setup required.
+#ifndef NVMEV_CSD_PROFILE_OVERRIDE
+#define NVMEV_CSD_PROFILE_OVERRIDE (0)
+#endif
+#define NVMEV_CSD_PROFILE		(NVMEV_CSD_PROFILE_OVERRIDE)
 
 #if (NVMEV_CSD_PROFILE == 0)
 #define NVMEV_CSD_PROFILE_START(core_name, core_num, task_id, subtask_id)

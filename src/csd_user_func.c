@@ -89,6 +89,8 @@ size_t __csdvirt_run_program(int program_idx, void *buf_in, void *buf_out, size_
 		ret = __rocksdb_crc_calculation((char *) buf_in, (char *) buf_out, size, params);
 	} else if (program_idx == ROCKSDB_READ_PROGRAM_INDEX) {
 		ret = __rocksdb_read((char *) buf_in, (char *) buf_out, size, params);
+	} else if (program_idx == ROCKSDB_MVCC_FILTER_PROGRAM_INDEX) {
+		ret = __rocksdb_mvcc_filter((char *) buf_in, (char *) buf_out, size, params);
 	} else {
 		printk("INVALID PROGRAM_INDEX %d\n", program_idx);
 	}
@@ -3311,6 +3313,372 @@ out:
 
 	CSD_DEBUG_MAGIC_READ("DONE: result=%lu, found=%d\n", result, is_found);
 	return result;
+}
+
+/* ============================================================================
+ * __rocksdb_mvcc_filter -- naive/sync baseline offload of RocksDB's
+ * DBIter::FindNextUserEntry MVCC-version-skipping logic, ONE SST FILE AT A TIME.
+ *
+ * Unlike __rocksdb_compaction/__rocksdb_read above, this kernel does NOT assume
+ * this module's own simplified SST layout (fixed-width keys, shared==0, inline
+ * restart sentinels). buf_in is the WHOLE, ordinary RocksDB SST file exactly as
+ * written by a real (format_version=6) BlockBasedTable writer, and this kernel
+ * parses its footer, metaindex block, and index block itself to find data
+ * blocks. See rocksdb_mvcc_filter_params / rocksdb_mvcc_filter_output in
+ * csd_user_func.h for the calling convention.
+ *
+ * Scope (deliberately naive):
+ *   - one SST file per call, no cross-file/cross-level merge (that stays the job
+ *     of the host's unmodified MergingIterator + DBIter::FindNextUserEntry);
+ *   - synchronous, whole-file-already-loaded (no async/dependency-table use).
+ *
+ * Filtering rules per internal key-value entry:
+ *   1. Visibility: drop entries whose sequence number is above snapshot_seq.
+ *   2. Same-user-key dedup: within one file, keys are sorted with descending
+ *      sequence number per user key, so the first visible entry for a user key
+ *      is the newest one; drop every subsequent entry for that same user key
+ *      (this correctly leaves a visible tombstone in the output -- it must NOT
+ *      be dropped, since a merged multi-file scan needs to see it to shadow an
+ *      older visible version of the same key living in a different SST).
+ *   3. kTypeMerge entries always pass through and never participate in dedup
+ *      bookkeeping (every merge operand must reach the host).
+ * ============================================================================
+ */
+
+#define MVCC_FOOTER_SIZE 53
+#define MVCC_FORMAT_VERSION 6 /* BlockBasedTable writer, MySQL 8.4-era RocksDB */
+#define MVCC_TYPE_MERGE 0x2 /* rocksdb::ValueType::kTypeMerge */
+
+/* Standard RocksDB block trailer: [entries...][restart_pt_0]...[restart_pt_{n-1}]
+ * [num_restarts], each restart_pt/num_restarts a fixed32. Returns a pointer to
+ * where the restart-point array begins (i.e. one past the last real entry), or
+ * NULL if the block is too small to even hold the num_restarts field. */
+static char *mvcc_block_restart_start(char *block_start, size_t block_size)
+{
+	char *block_end;
+	uint32_t num_restarts;
+
+	if (block_size < 4)
+		return NULL;
+	block_end = block_start + block_size;
+	num_restarts = DecodeFixed32(block_end - 4);
+	if ((size_t)num_restarts * 4 + 4 > block_size)
+		return NULL; /* corrupt: restart array would extend before block_start */
+	return block_end - 4 - ((size_t)num_restarts * 4);
+}
+
+/* Decode one standard block entry ([shared][non_shared][value_length][key_delta]
+ * [value]) -- used for metaindex-block and data-block entries -- and reconstruct
+ * the full key into key_buf, carrying the shared prefix forward from whatever was
+ * already in key_buf/*key_len (caller resets *key_len=0 at the start of each new
+ * block, since delta-encoding never crosses a block boundary). */
+static char *mvcc_decode_block_entry(char *p, char *limit, char *key_buf, size_t key_buf_cap,
+									 uint32_t *key_len, char **value_ptr, uint32_t *value_len)
+{
+	uint32_t shared, non_shared, vlen;
+	char *key_delta = DecodeEntry(p, limit, &shared, &non_shared, &vlen);
+
+	if (key_delta == NULL)
+		return NULL;
+	if (shared > *key_len)
+		return NULL; /* corrupt: shared prefix longer than the previous key */
+	if ((size_t)shared + non_shared > key_buf_cap)
+		return NULL; /* key too long for our scratch buffer -- bail out safely */
+	memcpy(key_buf + shared, key_delta, non_shared);
+	*key_len = shared + non_shared;
+	*value_ptr = key_delta + non_shared;
+	*value_len = vlen;
+	return *value_ptr + vlen;
+}
+
+/* Decode one INDEX-block entry. format_version >= 6 index entries OMIT the
+ * value_length field that ordinary block entries have -- the value is a
+ * BlockHandle {offset, size}, self-delimiting via its own two varints, so no
+ * declared length is needed. Do NOT reuse mvcc_decode_block_entry()/DecodeEntry()
+ * here, it assumes a value_length field that isn't present in this format. */
+static char *mvcc_decode_index_entry(char *p, char *limit, char *key_buf, size_t key_buf_cap,
+									 uint32_t *key_len, uint64_t *handle_offset,
+									 uint64_t *handle_size)
+{
+	uint32_t shared, non_shared;
+	char *key_delta, *vp;
+
+	key_delta = GetVarint32Ptr(p, limit, &shared);
+	if (key_delta == NULL)
+		return NULL;
+	key_delta = GetVarint32Ptr(key_delta, limit, &non_shared);
+	if (key_delta == NULL)
+		return NULL;
+	if (shared > *key_len)
+		return NULL;
+	if ((size_t)shared + non_shared > key_buf_cap)
+		return NULL;
+	if ((limit - key_delta) < (int64_t)non_shared)
+		return NULL;
+	memcpy(key_buf + shared, key_delta, non_shared);
+	*key_len = shared + non_shared;
+
+	vp = key_delta + non_shared;
+	vp = GetVarint64Ptr(vp, limit, handle_offset);
+	if (vp == NULL)
+		return NULL;
+	vp = GetVarint64Ptr(vp, limit, handle_size);
+	if (vp == NULL)
+		return NULL;
+	return vp;
+}
+
+/* Emit one already-filtered internal-key/value pair into the flat
+ * [u32 key_len][key][u32 value_len][value] output stream via set_data_from_ptr()
+ * (the SLM-aware write helper every other sync kernel in this file uses).
+ * Returns false (and writes nothing) if it would overflow out_limit. */
+static bool mvcc_emit_entry(char **out_ptr, char *out_limit, char *key, uint32_t key_len,
+							char *value, uint32_t value_len)
+{
+	if ((size_t)(out_limit - *out_ptr) < (size_t)4 + key_len + 4 + value_len)
+		return false;
+
+	set_data_from_ptr((size_t)*out_ptr, (size_t)&key_len, sizeof(key_len));
+	*out_ptr += sizeof(key_len);
+	set_data_from_ptr((size_t)*out_ptr, (size_t)key, key_len);
+	*out_ptr += key_len;
+	set_data_from_ptr((size_t)*out_ptr, (size_t)&value_len, sizeof(value_len));
+	*out_ptr += sizeof(value_len);
+	set_data_from_ptr((size_t)*out_ptr, (size_t)value, value_len);
+	*out_ptr += value_len;
+	return true;
+}
+
+size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *param)
+{
+	struct CSD_PARAMS *temp = (struct CSD_PARAMS *)param;
+	int pid = temp->profile_info.pid;
+	int host_id = temp->profile_info.host_id;
+	size_t file_len = temp->rocksdb_mvcc_filter_params.sstable_size;
+	uint64_t snapshot_seq = temp->rocksdb_mvcc_filter_params.snapshot_seq;
+	size_t output_capacity = temp->rocksdb_mvcc_filter_params.output_capacity;
+
+	char *file_data = (char *)buf_in;
+	struct rocksdb_mvcc_filter_output *out_header =
+		(struct rocksdb_mvcc_filter_output *)buf_out;
+	char *out_ptr = (char *)buf_out + sizeof(struct rocksdb_mvcc_filter_output);
+	char *out_limit = (char *)buf_out + output_capacity;
+
+	uint64_t keys_seen = 0, keys_filtered = 0;
+	char *footer, *metaindex_start, *metaindex_restart_limit;
+	uint64_t file_magic;
+	uint32_t format_version, metaindex_size;
+	uint64_t index_handle_offset = 0, index_handle_size = 0;
+	bool found_index = false;
+
+	char meta_key_buf[40];
+	uint32_t meta_key_len;
+	char index_key_buf[40];
+	uint32_t index_key_len;
+	char data_key_buf[48];
+	uint32_t data_key_len;
+	char prev_user_key[40];
+	uint32_t prev_user_key_len = 0;
+	bool have_prev_user_key = false;
+
+	static const char kIndexMetaKey[] = "rocksdb.index";
+	const uint32_t kIndexMetaKeyLen = sizeof(kIndexMetaKey) - 1;
+
+	char *index_start, *index_restart_limit, *ip;
+
+	NVMEV_CSD_PROFILE_REAL_START(pid, host_id);
+	CSD_DEBUG("rocksdb_mvcc_filter: file_len=%zu snapshot_seq=%llu output_capacity=%zu\n",
+			  file_len, (unsigned long long)snapshot_seq, output_capacity);
+
+	if (output_capacity < sizeof(struct rocksdb_mvcc_filter_output)) {
+		printk("nvmevirt mvcc_filter: output_capacity too small\n");
+		goto done;
+	}
+	if (file_len < MVCC_FOOTER_SIZE || file_len > size) {
+		printk("nvmevirt mvcc_filter: bad file_len %zu (buf size %zu)\n", file_len, size);
+		goto done;
+	}
+
+	/* No check_data_using_ptr() here (unlike other kernels in this file) --
+	 * that call spins (no timeout, in this non-_info variant) waiting for
+	 * the requested range to become "ready" via the incremental head/tail
+	 * demand-load protocol, which is the wrong model for us: by the time
+	 * EXECUTE is dispatched, the host's csdvirt_load_files() has ALREADY
+	 * completed a separate, synchronous, whole-file blocking load
+	 * (host-managed copy-then-execute design), so the whole file is
+	 * unconditionally resident already. For large multi-round-loaded files
+	 * the spin never actually saw the range as ready and hung until the
+	 * outer NVMe command timeout (~60s) killed it -- confirmed via
+	 * checkpoint logging showing entry but never reaching metaindex
+	 * parsing. Removed here and at the two other check_data_using_ptr call
+	 * sites below (index block, data block) for the same reason.
+	 */
+
+	footer = file_data + file_len - MVCC_FOOTER_SIZE;
+	file_magic = DecodeFixed64(footer + 45);
+	if (file_magic != kBlockBasedTableMagicNumber) {
+		printk("nvmevirt mvcc_filter: bad magic 0x%llx\n", (unsigned long long)file_magic);
+		goto done;
+	}
+	format_version = DecodeFixed32(footer + 41);
+	if (format_version != MVCC_FORMAT_VERSION) {
+		printk("nvmevirt mvcc_filter: unsupported format_version %u (expected %d)\n",
+			   format_version, MVCC_FORMAT_VERSION);
+		goto done;
+	}
+	metaindex_size = DecodeFixed32(footer + 13);
+	if (metaindex_size == 0 || (size_t)metaindex_size + kBlockTrailerSize + MVCC_FOOTER_SIZE > file_len) {
+		printk("nvmevirt mvcc_filter: bad metaindex_size %u\n", metaindex_size);
+		goto done;
+	}
+	metaindex_start = footer - kBlockTrailerSize - metaindex_size;
+
+	/* --- scan the metaindex block for the "rocksdb.index" handle --- */
+	metaindex_restart_limit = mvcc_block_restart_start(metaindex_start, metaindex_size);
+	if (metaindex_restart_limit == NULL || metaindex_restart_limit < metaindex_start) {
+		printk("nvmevirt mvcc_filter: bad metaindex restart array\n");
+		goto done;
+	}
+	{
+		char *p = metaindex_start;
+
+		meta_key_len = 0;
+		while (p < metaindex_restart_limit) {
+			char *value_ptr;
+			uint32_t value_len;
+			char *next = mvcc_decode_block_entry(p, metaindex_restart_limit, meta_key_buf,
+												 sizeof(meta_key_buf), &meta_key_len,
+												 &value_ptr, &value_len);
+			if (next == NULL) {
+				printk("nvmevirt mvcc_filter: metaindex parse error\n");
+				break;
+			}
+			if (meta_key_len == kIndexMetaKeyLen &&
+				memcmp(meta_key_buf, kIndexMetaKey, kIndexMetaKeyLen) == 0) {
+				char *vp = GetVarint64Ptr(value_ptr, value_ptr + value_len, &index_handle_offset);
+				if (vp != NULL)
+					vp = GetVarint64Ptr(vp, value_ptr + value_len, &index_handle_size);
+				found_index = (vp != NULL);
+				break;
+			}
+			p = next;
+		}
+	}
+	if (!found_index) {
+		printk("nvmevirt mvcc_filter: rocksdb.index handle not found in metaindex\n");
+		goto done;
+	}
+	if (index_handle_offset + index_handle_size > file_len) {
+		printk("nvmevirt mvcc_filter: index handle out of bounds\n");
+		goto done;
+	}
+
+	/* --- walk the index block; filter each referenced data block as we go --- */
+	index_start = file_data + index_handle_offset;
+	index_restart_limit = mvcc_block_restart_start(index_start, index_handle_size);
+	if (index_restart_limit == NULL || index_restart_limit < index_start) {
+		printk("nvmevirt mvcc_filter: bad index restart array\n");
+		goto done;
+	}
+	/* check_data_using_ptr() removed here too -- see comment at this
+	 * function's entry. */
+
+	index_key_len = 0;
+	ip = index_start;
+	while (ip < index_restart_limit) {
+		uint64_t data_offset, data_size;
+		char *block_start, *block_restart_limit, *bp;
+		char *next = mvcc_decode_index_entry(ip, index_restart_limit, index_key_buf,
+											 sizeof(index_key_buf), &index_key_len,
+											 &data_offset, &data_size);
+		if (next == NULL) {
+			printk("nvmevirt mvcc_filter: index block parse error\n");
+			break;
+		}
+		ip = next;
+
+		if (data_offset + data_size > file_len) {
+			printk("nvmevirt mvcc_filter: data block out of bounds\n");
+			break;
+		}
+
+		/* --- filter one data block --- */
+		block_start = file_data + data_offset;
+		block_restart_limit = mvcc_block_restart_start(block_start, data_size);
+		if (block_restart_limit == NULL || block_restart_limit < block_start) {
+			printk("nvmevirt mvcc_filter: bad data-block restart array, skipping block\n");
+			continue;
+		}
+		/* check_data_using_ptr() removed here too -- see comment at this
+		 * function's entry. */
+
+		data_key_len = 0; /* delta-decode state resets at the start of every block */
+		bp = block_start;
+		while (bp < block_restart_limit) {
+			char *value_ptr;
+			uint32_t value_len;
+			uint64_t suffix, seq;
+			uint8_t vtype;
+			uint32_t user_key_len;
+			bool emit = false;
+			char *bnext = mvcc_decode_block_entry(bp, block_restart_limit, data_key_buf,
+												  sizeof(data_key_buf), &data_key_len,
+												  &value_ptr, &value_len);
+			if (bnext == NULL) {
+				printk("nvmevirt mvcc_filter: data block parse error\n");
+				break;
+			}
+			bp = bnext;
+
+			if (data_key_len < kNumInternalBytes) {
+				printk("nvmevirt mvcc_filter: internal key too short (%u)\n", data_key_len);
+				continue;
+			}
+
+			keys_seen++;
+			suffix = DecodeFixed64(data_key_buf + data_key_len - kNumInternalBytes);
+			seq = suffix >> 8;
+			vtype = (uint8_t)(suffix & 0xff);
+			user_key_len = data_key_len - kNumInternalBytes;
+
+			if (seq > snapshot_seq) {
+				/* Rule 1: invisible to this snapshot */
+				keys_filtered++;
+			} else if (vtype == MVCC_TYPE_MERGE) {
+				/* Rule 3: merge operands always pass through untouched, and never
+				 * participate in same-key dedup (every operand must reach the host) */
+				emit = true;
+			} else if (have_prev_user_key && prev_user_key_len == user_key_len &&
+					   memcmp(prev_user_key, data_key_buf, user_key_len) == 0) {
+				/* Rule 2: older version of a user key we already kept the newest
+				 * visible entry for (including a tombstone -- which we DO emit
+				 * below, since the host's cross-file merge needs to see it) */
+				keys_filtered++;
+			} else {
+				emit = true;
+				memcpy(prev_user_key, data_key_buf, user_key_len);
+				prev_user_key_len = user_key_len;
+				have_prev_user_key = true;
+			}
+
+			if (emit) {
+				if (!mvcc_emit_entry(&out_ptr, out_limit, data_key_buf, data_key_len,
+									 value_ptr, value_len)) {
+					printk("nvmevirt mvcc_filter: output buffer full, truncating\n");
+					goto scan_done;
+				}
+			}
+		}
+	}
+
+scan_done:
+done:
+	if ((char *)buf_out + sizeof(struct rocksdb_mvcc_filter_output) <= out_limit) {
+		out_header->keys_seen = keys_seen;
+		out_header->keys_filtered = keys_filtered;
+	}
+	NVMEV_CSD_PROFILE_REAL_END(pid, host_id);
+	return (size_t)(out_ptr - (char *)buf_out);
 }
 
 size_t __rocksdb_read(void *buf_in, void *buf_out, size_t size, void *param)

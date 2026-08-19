@@ -27,8 +27,18 @@
 #define NVMEV_CSD_INFO(ns_name, string, args...)
 // #define NVMEV_CSD_INFO(ns_name, string, args...) printk("[CSD_DEBUG][NS:%s] (%s) " string, ns_name, __func__, ##args)
 
-// Async Command — single toggle: 1 = FLAX, 0 = host-managed CSD
-#define SUPPORT_ASYNC (1)
+// Async Command — single toggle: 1 = FLAX, 0 = host-managed CSD.
+// Set to 0 for this project: ROCKSDB_MVCC_FILTER_PROGRAM_INDEX is a naive,
+// fully-synchronous v1 baseline (host loads the whole SST via memory_copy,
+// then issues EXECUTE and blocks for the real result) -- exactly what this
+// mode is for. Under SUPPORT_ASYNC=1, that mismatch caused two confirmed
+// bugs (input- and output-SLM-readiness both left in the incremental
+// head/tail model with nothing to advance them for a one-shot synchronous
+// producer/consumer), previously patched around with a per-program
+// IS_FORCE_SYNC_PROGRAM_INDEX override that's no longer needed now that
+// everything is synchronous by default. Revisit only if a future async/
+// pipelined offload kernel is added that actually needs SUPPORT_ASYNC=1.
+#define SUPPORT_ASYNC (0)
 #define SUPPORT_ASYNC_MEM_COPY (SUPPORT_ASYNC)
 #define SUPPORT_ASYNC_MEM_COPY_DEMAND (SUPPORT_ASYNC)
 #define SUPPORT_ASYNC_COMPUTE (SUPPORT_ASYNC_MEM_COPY)
