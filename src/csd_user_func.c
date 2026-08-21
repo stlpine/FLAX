@@ -3504,13 +3504,33 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 	 * refills its quota while stream_access is set, and that is set only by a
 	 * probe at a non-zero offset, so a single whole-range probe stalls the
 	 * load after the first page.
+	 *
+	 * Open-coded rather than calling check_data_using_ptr: that spins with no
+	 * timeout and no kthread_should_stop check, so a stalled load leaves this
+	 * thread unkillable and rmmod hangs in kthread_stop, needing a host
+	 * reboot. Give up instead and return 0, which the host reads as a failed
+	 * offload and falls back.
 	 */
 	{
 		size_t off;
+		unsigned long deadline = jiffies + 30 * HZ;
 
-		for (off = 0; off < file_len; off += SLM_PAGE_SIZE)
-			check_data_using_ptr((size_t)file_data + off, SLM_PAGE_SIZE, pid,
-					     host_id);
+		for (off = 0; off < file_len; off += SLM_PAGE_SIZE) {
+			size_t page_addr = (size_t)file_data + off;
+
+			if (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false))
+				continue;
+
+			slm_request_demand_read(page_addr, SLM_PAGE_SIZE);
+			while (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
+				if (time_after(jiffies, deadline)) {
+					printk("nvmevirt mvcc_filter: input wait timed out at %zu of %zu\n",
+					       off, file_len);
+					goto fail;
+				}
+				cond_resched();
+			}
+		}
 	}
 
 	footer = file_data + file_len - MVCC_FOOTER_SIZE;
@@ -3674,6 +3694,12 @@ done:
 	}
 	NVMEV_CSD_PROFILE_REAL_END(pid, host_id);
 	return (size_t)(out_ptr - (char *)buf_out);
+
+fail:
+	/* No header written, so the host's read-back comes up short and it falls
+	 * back to the unfiltered reader rather than seeing an empty result. */
+	NVMEV_CSD_PROFILE_REAL_END(pid, host_id);
+	return 0;
 }
 
 size_t __rocksdb_read(void *buf_in, void *buf_out, size_t size, void *param)
