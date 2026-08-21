@@ -3518,18 +3518,25 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 		for (off = 0; off < file_len; off += SLM_PAGE_SIZE) {
 			size_t page_addr = (size_t)file_data + off;
 
-			if (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false))
-				continue;
-
-			slm_request_demand_read(page_addr, SLM_PAGE_SIZE);
-			while (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
-				if (time_after(jiffies, deadline)) {
-					printk("nvmevirt mvcc_filter: input wait timed out at %zu of %zu\n",
-					       off, file_len);
-					goto fail;
+			if (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
+				slm_request_demand_read(page_addr, SLM_PAGE_SIZE);
+				while (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
+					if (time_after(jiffies, deadline)) {
+						printk("nvmevirt mvcc_filter: input wait timed out at %zu of %zu\n",
+						       off, file_len);
+						goto fail;
+					}
+					cond_resched();
 				}
-				cond_resched();
 			}
+
+			/* Back-pressure the loader throttle reads. Without it ht_tail stays
+			 * at 0, the loader stops one IO_REQUEST_SIZE window past the start
+			 * and the rest of the file never arrives. Safe to signal before the
+			 * page is actually parsed: this region is linear, so nothing reuses
+			 * the space behind the tail.
+			 */
+			notify_compute_ready(page_addr);
 		}
 	}
 
