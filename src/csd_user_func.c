@@ -3499,11 +3499,19 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 		goto done;
 	}
 
-	/* Under async the load is still in flight, and the footer is at the end
-	 * of the file so it lands last. Probe from offset 0: a scattered probe
-	 * would flip the region to demand/extent mode.
+	/* Wait for the whole file: the footer is at the end and is needed first.
+	 * Probe one page at a time, not the whole range at once. The loader only
+	 * refills its quota while stream_access is set, and that is set only by a
+	 * probe at a non-zero offset, so a single whole-range probe stalls the
+	 * load after the first page.
 	 */
-	check_data_using_ptr((size_t)file_data, file_len, pid, host_id);
+	{
+		size_t off;
+
+		for (off = 0; off < file_len; off += SLM_PAGE_SIZE)
+			check_data_using_ptr((size_t)file_data + off, SLM_PAGE_SIZE, pid,
+					     host_id);
+	}
 
 	footer = file_data + file_len - MVCC_FOOTER_SIZE;
 	file_magic = DecodeFixed64(footer + 45);
