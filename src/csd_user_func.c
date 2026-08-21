@@ -3499,20 +3499,11 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 		goto done;
 	}
 
-	/* No check_data_using_ptr() here (unlike other kernels in this file) --
-	 * that call spins (no timeout, in this non-_info variant) waiting for
-	 * the requested range to become "ready" via the incremental head/tail
-	 * demand-load protocol, which is the wrong model for us: by the time
-	 * EXECUTE is dispatched, the host's csdvirt_load_files() has ALREADY
-	 * completed a separate, synchronous, whole-file blocking load
-	 * (host-managed copy-then-execute design), so the whole file is
-	 * unconditionally resident already. For large multi-round-loaded files
-	 * the spin never actually saw the range as ready and hung until the
-	 * outer NVMe command timeout (~60s) killed it -- confirmed via
-	 * checkpoint logging showing entry but never reaching metaindex
-	 * parsing. Removed here and at the two other check_data_using_ptr call
-	 * sites below (index block, data block) for the same reason.
+	/* Under async the load is still in flight, and the footer is at the end
+	 * of the file so it lands last. Probe from offset 0: a scattered probe
+	 * would flip the region to demand/extent mode.
 	 */
+	check_data_using_ptr((size_t)file_data, file_len, pid, host_id);
 
 	footer = file_data + file_len - MVCC_FOOTER_SIZE;
 	file_magic = DecodeFixed64(footer + 45);
@@ -3580,8 +3571,6 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 		printk("nvmevirt mvcc_filter: bad index restart array\n");
 		goto done;
 	}
-	/* check_data_using_ptr() removed here too -- see comment at this
-	 * function's entry. */
 
 	index_key_len = 0;
 	ip = index_start;
@@ -3609,8 +3598,6 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 			printk("nvmevirt mvcc_filter: bad data-block restart array, skipping block\n");
 			continue;
 		}
-		/* check_data_using_ptr() removed here too -- see comment at this
-		 * function's entry. */
 
 		data_key_len = 0; /* delta-decode state resets at the start of every block */
 		bp = block_start;
