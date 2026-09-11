@@ -91,6 +91,8 @@ size_t __csdvirt_run_program(int program_idx, void *buf_in, void *buf_out, size_
 		ret = __rocksdb_read((char *) buf_in, (char *) buf_out, size, params);
 	} else if (program_idx == ROCKSDB_MVCC_FILTER_PROGRAM_INDEX) {
 		ret = __rocksdb_mvcc_filter((char *) buf_in, (char *) buf_out, size, params);
+	} else if (program_idx == ROCKSDB_MVCC_GROUP_FILTER_PROGRAM_INDEX) {
+		ret = __rocksdb_mvcc_group_filter((char *) buf_in, (char *) buf_out, size, params);
 	} else {
 		printk("INVALID PROGRAM_INDEX %d\n", program_idx);
 	}
@@ -3449,22 +3451,101 @@ static bool mvcc_emit_entry(char **out_ptr, char *out_limit, char *key, uint32_t
 	return true;
 }
 
-size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *param)
+/* One SST slot whose tail the host rotated to the front:
+ *
+ *     slot[0 .. tail_len)        = file[tail_start .. file_len)   index + footer
+ *     slot[tail_len .. file_len) = file[0 .. tail_start)          data blocks
+ *
+ * ht_head only advances contiguously, so loading the tail into its natural
+ * position would leave it unreadable until the gap ahead of it filled. Loading
+ * it first keeps every write forward-only and still gets the index in before
+ * the data blocks.
+ *
+ * tail_len == 0 means the slot is unrotated.
+ */
+struct mvcc_file_view {
+	char *slot;
+	uint64_t file_len;
+	uint64_t tail_start;
+	uint64_t tail_len;
+};
+
+static inline char *mvcc_at(const struct mvcc_file_view *v, uint64_t file_off)
 {
-	struct CSD_PARAMS *temp = (struct CSD_PARAMS *)param;
-	int pid = temp->profile_info.pid;
-	int host_id = temp->profile_info.host_id;
-	size_t file_len = temp->rocksdb_mvcc_filter_params.sstable_size;
-	uint64_t snapshot_seq = temp->rocksdb_mvcc_filter_params.snapshot_seq;
-	size_t output_capacity = temp->rocksdb_mvcc_filter_params.output_capacity;
+	return (file_off >= v->tail_start) ? v->slot + (file_off - v->tail_start)
+					   : v->slot + v->tail_len + file_off;
+}
 
-	char *file_data = (char *)buf_in;
-	struct rocksdb_mvcc_filter_output *out_header =
-		(struct rocksdb_mvcc_filter_output *)buf_out;
-	char *out_ptr = (char *)buf_out + sizeof(struct rocksdb_mvcc_filter_output);
-	char *out_limit = (char *)buf_out + output_capacity;
+/* Wait for [base, base+len) to land, one page at a time.
+ *
+ * Probe per page, not the whole range: the loader refills its quota only while
+ * stream_access is set, and only a probe at a non-zero offset sets it.
+ *
+ * Open-coded rather than check_data_using_ptr, which spins with no timeout and
+ * no kthread_should_stop check, so a stalled load makes rmmod hang.
+ */
+static bool mvcc_wait_range(char *base, size_t len)
+{
+	size_t off;
+	unsigned long deadline = jiffies + 30 * HZ;
 
-	uint64_t keys_seen = 0, keys_filtered = 0;
+	for (off = 0; off < len; off += SLM_PAGE_SIZE) {
+		size_t page_addr = (size_t)base + off;
+
+		if (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
+			slm_request_demand_read(page_addr, SLM_PAGE_SIZE);
+			while (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
+				if (time_after(jiffies, deadline)) {
+					printk("nvmevirt mvcc_filter: input wait timed out at %zu of %zu\n",
+						   off, len);
+					return false;
+				}
+				cond_resched();
+			}
+		}
+
+		/* Back-pressure the loader throttle reads. Without it ht_tail stays
+		 * at 0, the loader stops one IO_REQUEST_SIZE window past the start
+		 * and the rest of the file never arrives. Safe to signal before the
+		 * page is actually parsed: this region is linear, so nothing reuses
+		 * the space behind the tail.
+		 */
+		notify_compute_ready(page_addr);
+	}
+	return true;
+}
+
+/* Wait for a file-offset range. Ranges never straddle the rotation seam: data
+ * blocks are all below tail_start and index/metaindex/footer are all at or
+ * above it, so one contiguous slot range always covers the request.
+ */
+static bool mvcc_wait_file_range(const struct mvcc_file_view *v, uint64_t file_off,
+								 uint64_t len)
+{
+	if (file_off + len > v->file_len)
+		len = v->file_len - file_off;
+	if ((file_off < v->tail_start) && (file_off + len > v->tail_start)) {
+		printk("nvmevirt mvcc_filter: range %llu+%llu crosses the rotation seam\n",
+			   (unsigned long long)file_off, (unsigned long long)len);
+		return false;
+	}
+	return mvcc_wait_range(mvcc_at(v, file_off), (size_t)len);
+}
+
+/* Filter one SST resident (or arriving) in its slot. Shared by the single-file
+ * and grouped programs so the two cannot drift. With stream set, only the tail
+ * is waited for up front and each data block as the index names it.
+ */
+static bool mvcc_filter_view(const struct mvcc_file_view *v, uint64_t snapshot_seq,
+							 bool stream, char **out_ptr_io, char *out_limit,
+							 uint64_t *keys_seen_io, uint64_t *keys_filtered_io,
+							 bool *truncated)
+{
+	uint64_t file_len = v->file_len;
+	uint64_t keys_seen = *keys_seen_io, keys_filtered = *keys_filtered_io;
+	char *out_ptr = *out_ptr_io;
+	bool ok = false;
+
 	char *footer, *metaindex_start, *metaindex_restart_limit;
 	uint64_t file_magic;
 	uint32_t format_version, metaindex_size;
@@ -3477,6 +3558,8 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 	uint32_t index_key_len;
 	char data_key_buf[48];
 	uint32_t data_key_len;
+	/* Per file: L1+ key ranges do not overlap, but L0's do, so carrying this
+	 * across a file boundary would drop a live key. */
 	char prev_user_key[40];
 	uint32_t prev_user_key_len = 0;
 	bool have_prev_user_key = false;
@@ -3486,61 +3569,19 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 
 	char *index_start, *index_restart_limit, *ip;
 
-	NVMEV_CSD_PROFILE_REAL_START(pid, host_id);
-	CSD_DEBUG("rocksdb_mvcc_filter: file_len=%zu snapshot_seq=%llu output_capacity=%zu\n",
-			  file_len, (unsigned long long)snapshot_seq, output_capacity);
-
-	if (output_capacity < sizeof(struct rocksdb_mvcc_filter_output)) {
-		printk("nvmevirt mvcc_filter: output_capacity too small\n");
-		goto done;
-	}
-	if (file_len < MVCC_FOOTER_SIZE || file_len > size) {
-		printk("nvmevirt mvcc_filter: bad file_len %zu (buf size %zu)\n", file_len, size);
-		goto done;
-	}
-
-	/* Wait for the whole file: the footer is at the end and is needed first.
-	 * Probe one page at a time, not the whole range at once. The loader only
-	 * refills its quota while stream_access is set, and that is set only by a
-	 * probe at a non-zero offset, so a single whole-range probe stalls the
-	 * load after the first page.
-	 *
-	 * Open-coded rather than calling check_data_using_ptr: that spins with no
-	 * timeout and no kthread_should_stop check, so a stalled load leaves this
-	 * thread unkillable and rmmod hangs in kthread_stop, needing a host
-	 * reboot. Give up instead and return 0, which the host reads as a failed
-	 * offload and falls back.
-	 */
-	{
-		size_t off;
-		unsigned long deadline = jiffies + 30 * HZ;
-
-		for (off = 0; off < file_len; off += SLM_PAGE_SIZE) {
-			size_t page_addr = (size_t)file_data + off;
-
-			if (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
-				slm_request_demand_read(page_addr, SLM_PAGE_SIZE);
-				while (check_slm_data_ready(page_addr, SLM_PAGE_SIZE, false) == false) {
-					if (time_after(jiffies, deadline)) {
-						printk("nvmevirt mvcc_filter: input wait timed out at %zu of %zu\n",
-						       off, file_len);
-						goto fail;
-					}
-					cond_resched();
-				}
-			}
-
-			/* Back-pressure the loader throttle reads. Without it ht_tail stays
-			 * at 0, the loader stops one IO_REQUEST_SIZE window past the start
-			 * and the rest of the file never arrives. Safe to signal before the
-			 * page is actually parsed: this region is linear, so nothing reuses
-			 * the space behind the tail.
-			 */
-			notify_compute_ready(page_addr);
-		}
+	if (stream && v->tail_len > 0) {
+		/* The rotated tail carries footer, metaindex and index. */
+		if (!mvcc_wait_range(v->slot, (size_t)v->tail_len))
+			goto done;
+	} else {
+		/* Unrotated, or no tail offset from the host: the footer is at the far
+		 * end, so nothing can be parsed until the whole file is here. */
+		stream = false;
+		if (!mvcc_wait_range(v->slot, (size_t)file_len))
+			goto done;
 	}
 
-	footer = file_data + file_len - MVCC_FOOTER_SIZE;
+	footer = mvcc_at(v, file_len - MVCC_FOOTER_SIZE);
 	file_magic = DecodeFixed64(footer + 45);
 	if (file_magic != kBlockBasedTableMagicNumber) {
 		printk("nvmevirt mvcc_filter: bad magic 0x%llx\n", (unsigned long long)file_magic);
@@ -3600,7 +3641,19 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 	}
 
 	/* --- walk the index block; filter each referenced data block as we go --- */
-	index_start = file_data + index_handle_offset;
+	if (stream && index_handle_offset < v->tail_start) {
+		/* The host's tail did not reach back far enough to cover the index, so
+		 * the index bytes sit in the data region and are not here yet. Wait for
+		 * the rest of the slot and carry on unstreamed rather than reading
+		 * pages that have not landed. */
+		printk("nvmevirt mvcc_filter: index at %llu below tail_start %llu, not streaming\n",
+			   (unsigned long long)index_handle_offset,
+			   (unsigned long long)v->tail_start);
+		if (!mvcc_wait_range(v->slot + v->tail_len, (size_t)v->tail_start))
+			goto done;
+		stream = false;
+	}
+	index_start = mvcc_at(v, index_handle_offset);
 	index_restart_limit = mvcc_block_restart_start(index_start, index_handle_size);
 	if (index_restart_limit == NULL || index_restart_limit < index_start) {
 		printk("nvmevirt mvcc_filter: bad index restart array\n");
@@ -3627,7 +3680,12 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 		}
 
 		/* --- filter one data block --- */
-		block_start = file_data + data_offset;
+		if (stream && !mvcc_wait_file_range(v, data_offset, data_size + kBlockTrailerSize)) {
+			printk("nvmevirt mvcc_filter: wait failed for block at %llu\n",
+				   (unsigned long long)data_offset);
+			goto done;
+		}
+		block_start = mvcc_at(v, data_offset);
 		block_restart_limit = mvcc_block_restart_start(block_start, data_size);
 		if (block_restart_limit == NULL || block_restart_limit < block_start) {
 			printk("nvmevirt mvcc_filter: bad data-block restart array, skipping block\n");
@@ -3693,8 +3751,56 @@ size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *par
 		}
 	}
 
+	ok = true;
 scan_done:
+	if (out_ptr >= out_limit)
+		*truncated = true;
 done:
+	*out_ptr_io = out_ptr;
+	*keys_seen_io = keys_seen;
+	*keys_filtered_io = keys_filtered;
+	return ok;
+}
+
+size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *param)
+{
+	struct CSD_PARAMS *temp = (struct CSD_PARAMS *)param;
+	int pid = temp->profile_info.pid;
+	int host_id = temp->profile_info.host_id;
+	size_t file_len = temp->rocksdb_mvcc_filter_params.sstable_size;
+	uint64_t snapshot_seq = temp->rocksdb_mvcc_filter_params.snapshot_seq;
+	size_t output_capacity = temp->rocksdb_mvcc_filter_params.output_capacity;
+
+	struct rocksdb_mvcc_filter_output *out_header =
+		(struct rocksdb_mvcc_filter_output *)buf_out;
+	char *out_ptr = (char *)buf_out + sizeof(struct rocksdb_mvcc_filter_output);
+	char *out_limit = (char *)buf_out + output_capacity;
+	uint64_t keys_seen = 0, keys_filtered = 0;
+	bool truncated = false;
+	struct mvcc_file_view view;
+
+	NVMEV_CSD_PROFILE_REAL_START(pid, host_id);
+	CSD_DEBUG("rocksdb_mvcc_filter: file_len=%zu snapshot_seq=%llu output_capacity=%zu\n",
+			  file_len, (unsigned long long)snapshot_seq, output_capacity);
+
+	if (output_capacity < sizeof(struct rocksdb_mvcc_filter_output)) {
+		printk("nvmevirt mvcc_filter: output_capacity too small\n");
+		goto fail;
+	}
+	if (file_len < MVCC_FOOTER_SIZE || file_len > size) {
+		printk("nvmevirt mvcc_filter: bad file_len %zu (buf size %zu)\n", file_len, size);
+		goto fail;
+	}
+
+	/* Unrotated, whole-file wait: this arm is the measured baseline. */
+	view.slot = (char *)buf_in;
+	view.file_len = file_len;
+	view.tail_start = file_len;
+	view.tail_len = 0;
+
+	mvcc_filter_view(&view, snapshot_seq, false, &out_ptr, out_limit,
+					 &keys_seen, &keys_filtered, &truncated);
+
 	if ((char *)buf_out + sizeof(struct rocksdb_mvcc_filter_output) <= out_limit) {
 		out_header->keys_seen = keys_seen;
 		out_header->keys_filtered = keys_filtered;
@@ -3705,6 +3811,93 @@ done:
 fail:
 	/* No header written, so the host's read-back comes up short and it falls
 	 * back to the unfiltered reader rather than seeing an empty result. */
+	NVMEV_CSD_PROFILE_REAL_END(pid, host_id);
+	return 0;
+}
+
+/* One command over several SSTs. The host concatenates up to
+ * MAX_MVCC_GROUP_FILES slots into one input region and loads them in order,
+ * each slot tail-first (see mvcc_file_view), so the device can filter slot i
+ * while the loader fills slot i+1.
+ *
+ * Output is one rocksdb_mvcc_group_output header followed by the per-file
+ * streams back to back, each record naming where its stream starts.
+ */
+size_t __rocksdb_mvcc_group_filter(void *buf_in, void *buf_out, size_t size, void *param)
+{
+	struct CSD_PARAMS *temp = (struct CSD_PARAMS *)param;
+	int pid = temp->profile_info.pid;
+	int host_id = temp->profile_info.host_id;
+	struct rocksdb_mvcc_group_params *gp = &temp->rocksdb_mvcc_group_params;
+	int num_files = gp->num_files;
+	uint64_t snapshot_seq = gp->snapshot_seq;
+	size_t output_capacity = gp->output_capacity;
+
+	struct rocksdb_mvcc_group_output *out_header =
+		(struct rocksdb_mvcc_group_output *)buf_out;
+	char *out_base = (char *)buf_out + sizeof(struct rocksdb_mvcc_group_output);
+	char *out_ptr = out_base;
+	char *out_limit = (char *)buf_out + output_capacity;
+	bool truncated = false;
+	int i;
+
+	NVMEV_CSD_PROFILE_REAL_START(pid, host_id);
+
+	if (output_capacity < sizeof(struct rocksdb_mvcc_group_output)) {
+		printk("nvmevirt mvcc_group: output_capacity too small\n");
+		goto fail;
+	}
+	if (num_files <= 0 || num_files > MAX_MVCC_GROUP_FILES) {
+		printk("nvmevirt mvcc_group: bad num_files %d\n", num_files);
+		goto fail;
+	}
+
+	memset(out_header, 0, sizeof(*out_header));
+	out_header->num_files = num_files;
+
+	for (i = 0; i < num_files; i++) {
+		struct mvcc_file_view view;
+		uint64_t keys_seen = 0, keys_filtered = 0;
+		char *stream_start = out_ptr;
+
+		view.slot = (char *)buf_in + gp->file_start_offset[i];
+		view.file_len = gp->file_size[i];
+		view.tail_len = gp->wait_whole_file ? 0 : gp->tail_size[i];
+		view.tail_start = view.file_len - view.tail_len;
+
+		if (view.file_len < MVCC_FOOTER_SIZE ||
+		    gp->file_start_offset[i] + view.file_len > size ||
+		    view.tail_len > view.file_len) {
+			printk("nvmevirt mvcc_group: bad slot %d (offset %llu len %llu tail %llu)\n",
+				   i, (unsigned long long)gp->file_start_offset[i],
+				   (unsigned long long)view.file_len,
+				   (unsigned long long)view.tail_len);
+			goto fail;
+		}
+
+		/* wait_whole_file is the diagnostic arm: same grouping, no streaming,
+		 * so the two can be measured against each other without a rebuild. */
+		mvcc_filter_view(&view, snapshot_seq, !gp->wait_whole_file, &out_ptr,
+						 out_limit, &keys_seen, &keys_filtered, &truncated);
+
+		out_header->files[i].stream_offset = (uint64_t)(stream_start - (char *)buf_out);
+		out_header->files[i].stream_len = (uint64_t)(out_ptr - stream_start);
+		out_header->files[i].keys_seen = keys_seen;
+		out_header->files[i].keys_filtered = keys_filtered;
+
+		if (truncated) {
+			/* A short stream for one file would silently drop rows, and the
+			 * host cannot tell which file lost them, so fail the group and
+			 * let it fall back per file. */
+			printk("nvmevirt mvcc_group: output full at file %d of %d\n", i, num_files);
+			goto fail;
+		}
+	}
+
+	NVMEV_CSD_PROFILE_REAL_END(pid, host_id);
+	return (size_t)(out_ptr - (char *)buf_out);
+
+fail:
 	NVMEV_CSD_PROFILE_REAL_END(pid, host_id);
 	return 0;
 }

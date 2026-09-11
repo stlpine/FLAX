@@ -106,6 +106,7 @@ enum CSD_PROGRAM_INDEX {
 	ROCKSDB_MAGIC_COMPACTION_PROGRAM_INDEX,
 	ROCKSDB_MAGIC_CRC_PROGRAM_INDEX,
 	ROCKSDB_MAGIC_READ_PROGRAM_INDEX,
+	ROCKSDB_MVCC_GROUP_FILTER_PROGRAM_INDEX, // same filter, several SSTs per command
 	MULTI_STREAM_TYPE_PROGRAM_INDEX_END,
 
 	eBPF_PROGRAM_INDEX = 0x10000,
@@ -305,6 +306,49 @@ struct rocksdb_mvcc_filter_output {
 	uint64_t keys_filtered;
 };
 
+// Several SSTs filtered by one command (ROCKSDB_MVCC_GROUP_FILTER_PROGRAM_INDEX).
+// Transport is the compaction idiom: the host concatenates the files into one
+// SLM input region and passes each slot's offset here. 4 files matches
+// MAX_MAGIC_READ_FILES and the SLM budget at the sizes MyRocks produces.
+//
+// Each slot is loaded TAIL FIRST: the host issues one range load for
+// file[tail_start .. file_len) into the slot front and a second for
+// file[0 .. tail_start) behind it. Writes stay forward, which the SLM
+// readiness frontier requires, while the device gets footer/metaindex/index
+// before any data block and can filter block N while block N+1 is in flight.
+// tail_size is therefore a contract between host and device, not a hint: it
+// must cover the footer, the metaindex and the whole index block.
+#define MAX_MVCC_GROUP_FILES 4
+
+struct rocksdb_mvcc_group_params {
+	int num_files;
+	uint64_t file_start_offset[MAX_MVCC_GROUP_FILES]; // slot base within buf_in
+	uint64_t file_size[MAX_MVCC_GROUP_FILES]; // actual, unaligned
+	uint64_t tail_size[MAX_MVCC_GROUP_FILES]; // bytes rotated to the slot front
+	uint64_t snapshot_seq;
+	size_t output_capacity;
+	// Diagnostic arm: load each slot unrotated and wait for all of it before
+	// parsing, so grouping-without-streaming can be measured against
+	// grouping-with-streaming without a rebuild.
+	bool wait_whole_file;
+};
+
+// One per input file, in input order. stream_offset is relative to buf_out, so
+// the host hands each slice to its own iterator.
+struct rocksdb_mvcc_group_record {
+	uint64_t stream_offset;
+	uint64_t stream_len;
+	uint64_t keys_seen;
+	uint64_t keys_filtered;
+};
+
+// Fixed-size header: MAX_MVCC_GROUP_FILES records regardless of num_files, so
+// the first stream always starts at a constant offset. Unused records stay zeroed.
+struct rocksdb_mvcc_group_output {
+	uint64_t num_files;
+	struct rocksdb_mvcc_group_record files[MAX_MVCC_GROUP_FILES];
+};
+
 struct rocksdb_magic_read_params {
 	struct rocksdb_read_params read_params;
 	size_t input_buf;
@@ -349,6 +393,7 @@ struct CSD_PARAMS {
 		struct decoding_params decoding_params;
 		struct rocksdb_read_params rocksdb_read_params;
 		struct rocksdb_mvcc_filter_params rocksdb_mvcc_filter_params;
+		struct rocksdb_mvcc_group_params rocksdb_mvcc_group_params;
 	};
 	struct profile_info {
 		int pid;
@@ -495,6 +540,7 @@ size_t __rocksdb_compaction(void *buf_in, void *buf_out, size_t size, void *para
 size_t __rocksdb_crc_calculation(void *buf_in, void *buf_out, size_t size, void *param);
 size_t __rocksdb_read(void *buf_in, void *buf_out, size_t size, void *param);
 size_t __rocksdb_mvcc_filter(void *buf_in, void *buf_out, size_t size, void *param);
+size_t __rocksdb_mvcc_group_filter(void *buf_in, void *buf_out, size_t size, void *param);
 
 size_t __magic_rocksdb_compaction(void *param);
 size_t __magic_rocksdb_crc_calculation(void *param);
